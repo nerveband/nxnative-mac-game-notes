@@ -1,0 +1,228 @@
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index 89bdb3c..75467d5 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -51,7 +51,7 @@ endif
+ .PHONY: FORCE
+ FORCE:
+ dmhost: $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h dm_input.h pad_slots.h hle_haptics.h haptics_apple.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB)
+-	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreHaptics -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
++	clang $(CFLAGS) -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) -framework Cocoa -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
+ clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx build; dmhost_* and *.dSYM beside them, as in .gitignore)
+ 	rm -rf gen dmhost dmhost_* *.dSYM
+ .PHONY: clean
+diff --git a/dm/host/haptics_apple.m b/dm/host/haptics_apple.m
+index d22260c..41ce34c 100644
+--- a/dm/host/haptics_apple.m
++++ b/dm/host/haptics_apple.m
+@@ -8,6 +8,7 @@
+ #import <AVFAudio/AVFAudio.h>
+ #else
+ #import <AppKit/AppKit.h>
++#import <IOKit/hid/IOHIDManager.h>
+ #endif
+ #include <math.h>
+ #include <pthread.h>
+@@ -130,13 +131,111 @@ - (void)apply:(dm_haptic_level)level {
+ }
+ @end
+ 
++#if !TARGET_OS_IPHONE
++// The tested Stadia BLE device exposed no Core Haptics localities. Its HID output report 5
++// contains two little-endian 16-bit motor strengths, as documented by SDL.
++@interface DmStadiaRumbleChannel : DmRumbleChannel
++@property(nonatomic, assign) IOHIDDeviceRef device;
++- (void)applyState:(dm_haptic_state)state;
++- (void)sendLow:(uint16_t)low high:(uint16_t)high;
++@end
++@implementation DmStadiaRumbleChannel
++- (void)sendLow:(uint16_t)low high:(uint16_t)high {
++    uint8_t packet[] = {5, low & 255, low >> 8, high & 255, high >> 8};
++    IOReturn result = IOHIDDeviceSetReport(self.device, kIOHIDReportTypeOutput, 5, packet, sizeof(packet));
++    if (result != kIOReturnSuccess && ++errors <= 8)
++        fprintf(stderr, "haptics: Stadia HID write failed: %#x\n", result);
++}
++- (void)applyState:(dm_haptic_state)s {
++    // Average the two Joy-Con motors' band power into a conventional low/high
++    // motor pair. Do not sum both bands and drive both motors at that strength.
++    float lo = 0, hi = 0;
++    for (int i = 0; i < 2; i++) {
++        lo += s.motor[i].amplitude_low * s.motor[i].amplitude_low;
++        hi += s.motor[i].amplitude_high * s.motor[i].amplitude_high;
++    }
++    [self sendLow:(uint16_t)lrintf(fminf(1, sqrtf(lo / 2) * gain) * 65535)
++             high:(uint16_t)lrintf(fminf(1, sqrtf(hi / 2) * gain) * 65535)];
++}
++- (void)stop { [self sendLow:0 high:0]; }
++- (void)dealloc {
++    if (_device) {
++        [self stop]; IOHIDDeviceClose(_device, 0); CFRelease(_device);
++    }
++}
++@end
++// Microsoft's Bluetooth Xbox report uses 0..100 strengths and separate
++// trigger motors. This fallback leaves the triggers off.
++@interface DmXboxRumbleChannel : DmStadiaRumbleChannel
++@end
++@implementation DmXboxRumbleChannel
++- (void)sendLow:(uint16_t)low high:(uint16_t)high {
++    uint8_t packet[] = {3, 15, 0, 0, low / 655, high / 655, 255, 0, 235};
++    IOReturn result = IOHIDDeviceSetReport(self.device, kIOHIDReportTypeOutput, 3, packet, sizeof(packet));
++    if (result != kIOReturnSuccess && ++errors <= 8)
++        fprintf(stderr, "haptics: Xbox HID write failed: %#x\n", result);
++}
++@end
++static void hid_controller(int p, GCController *controller) {
++    IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, 0);
++    BOOL xbox = [controller.vendorName containsString:@"Xbox"];
++    NSDictionary *match = xbox ? @{@kIOHIDVendorIDKey: @0x045e} : @{@kIOHIDVendorIDKey: @0x18d1, @kIOHIDProductIDKey: @0x9400};
++    IOHIDManagerSetDeviceMatching(manager, (__bridge CFDictionaryRef)match);
++    CFSetRef devices = IOHIDManagerCopyDevices(manager);
++    for (id obj in (__bridge NSSet *)devices) {
++        IOHIDDeviceRef device = (__bridge IOHIDDeviceRef)obj;
++        NSString *name = (__bridge NSString *)IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductKey));
++        if (![name isEqualToString:controller.vendorName]) continue;
++        NSString *transport = (__bridge NSString *)IOHIDDeviceGetProperty(device, CFSTR(kIOHIDTransportKey));
++        if (xbox && ![transport hasPrefix:@"Bluetooth"]) continue;
++        BOOL used = NO;
++        for (int slot = 0; slot < DM_PLAYERS; slot++) for (DmRumbleChannel *c in channels[slot])
++            if ([c isKindOfClass:DmStadiaRumbleChannel.class] && ((DmStadiaRumbleChannel *)c).device == device) used = YES;
++        if (used || IOHIDDeviceOpen(device, 0) != kIOReturnSuccess) continue;
++        uint8_t stopStadia[] = {5, 0, 0, 0, 0};
++        uint8_t stopXbox[] = {3, 15, 0, 0, 0, 0, 255, 0, 235};
++        uint8_t *stop = xbox ? stopXbox : stopStadia;
++        size_t length = xbox ? sizeof(stopXbox) : sizeof(stopStadia);
++        if (IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, stop[0], stop, length) == kIOReturnSuccess) {
++            DmStadiaRumbleChannel *c = xbox ? [DmXboxRumbleChannel new] : [DmStadiaRumbleChannel new];
++            c.device = (IOHIDDeviceRef)CFRetain(device); c.player = p;
++            [channels[p] addObject:c];
++            fprintf(stderr, "haptics: player %d %s HID rumble enabled\n", p + 1, xbox ? "Xbox Bluetooth" : "Stadia");
++            break;
++        }
++        IOHIDDeviceClose(device, 0);
++    }
++    if (devices) CFRelease(devices);
++    CFRelease(manager);
++}
++#endif
++
++// Measured Stadia BLE writes took about 63 ms each.
++// Keep at most one waiting snapshot per player, never replay old effects.
++static pthread_mutex_t pendingLock = PTHREAD_MUTEX_INITIALIZER;
++static dm_haptic_state pendingState[DM_PLAYERS];
++static BOOL pendingOutput[DM_PLAYERS];
+ static void apply(dm_haptic_state s) {
++    int p = s.player;
++    pthread_mutex_lock(&pendingLock);
++    pendingState[p] = s;
++    BOOL queued = pendingOutput[p]; pendingOutput[p] = YES;
++    pthread_mutex_unlock(&pendingLock);
++    if (queued) return;
+     dispatch_async(queue, ^{ @autoreleasepool {
+-        if (s.epoch != dm_haptics_epoch(s.player)) return;
+-        NSArray<DmRumbleChannel *> *out = channels[s.player];
++        pthread_mutex_lock(&pendingLock);
++        dm_haptic_state current = pendingState[p]; pendingOutput[p] = NO;
++        pthread_mutex_unlock(&pendingLock);
++        if (current.epoch != dm_haptics_epoch(p)) return;
++        NSArray<DmRumbleChannel *> *out = channels[p];
+         for (NSUInteger i = 0; i < out.count; i++) {
+-            if (s.epoch != dm_haptics_epoch(s.player)) break;   // a failed channel may replace this route
+-            dm_haptic_level level = out.count == 2 ? dm_haptics_level(&s.motor[i], 1, gain) : dm_haptics_level(s.motor, 2, gain);
++            if (current.epoch != dm_haptics_epoch(p)) break;
++#if !TARGET_OS_IPHONE
++            if ([out[i] isKindOfClass:DmStadiaRumbleChannel.class]) {
++                [(DmStadiaRumbleChannel *)out[i] applyState:current]; continue;
++            }
++#endif
++            dm_haptic_level level = out.count == 2 ? dm_haptics_level(&current.motor[i], 1, gain) : dm_haptics_level(current.motor, 2, gain);
+             [out[i] apply:level];
+         }
+     } });
+@@ -152,6 +251,14 @@ static void default_controller(int p, GCDeviceHaptics *h, NSTimeInterval retryAf
+ static void configure(int p, GCController *controller) {
+     for (DmRumbleChannel *c in channels[p]) [c stop];
+     channels[p] = [NSMutableArray new];
++#if !TARGET_OS_IPHONE
++    // The Xbox Core Haptics helper can accept the engine but fail every pattern
++    // with NSCocoaErrorDomain 4097. Prefer its verified Bluetooth HID output.
++    if ([controller.vendorName containsString:@"Xbox"]) {
++        hid_controller(p, controller);
++        if (channels[p].count) { dm_haptics_route(p, 1); return; }
++    }
++#endif
+     if (controller) {
+         GCDeviceHaptics *h = controller.haptics;
+         NSSet *localities = h.supportedLocalities;
+@@ -179,6 +286,10 @@ static void configure(int p, GCController *controller) {
+         // Do not initialize the phone's engine before the game's audio session is active.
+         add_engine(p, @"phone", ^CHHapticEngine *(NSError **e) { return [[CHHapticEngine alloc] initWithAudioSession:AVAudioSession.sharedInstance error:e]; });
+     }
++#endif
++#if !TARGET_OS_IPHONE
++    if (controller && !channels[p].count && [controller.vendorName hasPrefix:@"Stadia"])
++        hid_controller(p, controller);
+ #endif
+     dm_haptics_route(p, channels[p].count != 0);
+ }
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index e969e2c..02c4b9e 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -114,7 +114,7 @@ $(B)/t_hid_tsan: t_hid.c ../hle_hid.c ../hle_haptics.c ../hle_haptics.h ../pad_s
+ $(B)/t_haptics: t_haptics.c ../hle_haptics.c ../hle_haptics.h ../dm_input.h | $(B)
+ 	clang -O1 -g -Wall -Werror -I.. -o $@ t_haptics.c ../hle_haptics.c
+ $(B)/t_haptics_apple: t_haptics_apple.m ../haptics_apple.m ../haptics_apple.h ../hle_haptics.c ../hle_haptics.h | $(B)
+-	clang -O1 -g -fobjc-arc -Wall -Werror -I.. -o $@ t_haptics_apple.m ../hle_haptics.c -framework Cocoa -framework GameController -framework CoreHaptics
++	clang -O1 -g -fobjc-arc -Wall -Werror -I.. -o $@ t_haptics_apple.m ../hle_haptics.c -framework Cocoa -framework GameController -framework CoreHaptics -framework IOKit
+ $(B)/t_time: t_time.c ../hle_time.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	clang -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_time.c
+ $(B)/t_oe: t_oe.c ../hle_oe.c ../hle.h ../dm.h $(GAME_H) | $(B)
+diff --git a/dm/host/tests/t_haptics_apple.m b/dm/host/tests/t_haptics_apple.m
+index 33e3699..e5acc03 100644
+--- a/dm/host/tests/t_haptics_apple.m
++++ b/dm/host/tests/t_haptics_apple.m
+@@ -78,6 +78,12 @@ @interface TestController : NSObject
+ @end
+ @implementation TestController
+ @end
++@interface TestStadia : DmStadiaRumbleChannel
++@property NSMutableArray<NSArray<NSNumber *> *> *packets;
++@end
++@implementation TestStadia
++- (void)sendLow:(uint16_t)low high:(uint16_t)high { [self.packets addObject:@[@(low), @(high)]]; }
++@end
+ static void drain(void) { dispatch_sync(queue, ^{}); dispatch_sync(queue, ^{}); }
+ static void expire_retries(void) {
+     dispatch_sync(queue, ^{ for (DmRumbleChannel *c in channels[0]) c.retryAfter = 0; });
+@@ -175,6 +181,30 @@ int main(void) { @autoreleasepool {
+     unsupported.haptics.supportedLocalities = [NSSet set];
+     dm_haptics_apple_controller(0, (id)unsupported); drain();
+     assert(!(dm_haptics_available() & 1) && unsupported.haptics.attempts == 0);
++    TestStadia *stadia = [TestStadia new]; stadia.packets = [NSMutableArray new];
++    dispatch_sync(queue, ^{ channels[0] = [NSMutableArray arrayWithObject:stadia]; });
++    dm_haptics_route(0, 1); drain(); [stadia.packets removeAllObjects];
++    // Emulate a blocked Bluetooth output queue while hundreds of game updates
++    // arrive, ending with stop. Only that current stop may reach the hardware.
++    dispatch_semaphore_t gate = dispatch_semaphore_create(0);
++    dispatch_async(queue, ^{ dispatch_semaphore_wait(gate, DISPATCH_TIME_FOREVER); });
++    for (int i = 0; i < 400; i++) {
++        dm_vibration_update u = {0, 0, {(i & 1) ? 0.8f : 0.4f, 160, 0, 320}};
++        dm_haptics_send(&u, 1);
++    }
++    dm_vibration_update stop = {0, 0, {0, 160, 0, 320}};
++    dm_haptics_send(&stop, 1);
++    dispatch_semaphore_signal(gate); drain();
++    assert(stadia.packets.count == 1);
++    assert(stadia.packets[0][0].intValue == 0 && stadia.packets[0][1].intValue == 0);
++    dm_vibration_update bands[] = {{0, 0, {0.4f, 160, 0.2f, 320}}, {0, 1, {0.4f, 160, 0.2f, 320}}};
++    dm_haptics_send(bands, 2); drain();
++    assert(abs(stadia.packets.lastObject[0].intValue - 26214) <= 1);
++    assert(abs(stadia.packets.lastObject[1].intValue - 13107) <= 1);
++    dm_haptics_suspend(DM_HAPTICS_INACTIVE, YES); drain();
++    assert(stadia.packets.lastObject[0].intValue == 0 && stadia.packets.lastObject[1].intValue == 0);
++    dm_haptics_suspend(DM_HAPTICS_INACTIVE, NO); drain();
++    puts("Stadia: queued effects coalesced to the latest stop, separate motor bands and focus-loss stop passed");
+     dm_haptics_apple_shutdown();
+     puts("Apple haptics: channels, pulses, idle release, startup handlers, engine replacement, backoff and stale callbacks passed");
+ } }

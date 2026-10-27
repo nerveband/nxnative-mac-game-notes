@@ -1,0 +1,119 @@
+diff --git a/dm/host/hle_audio.c b/dm/host/hle_audio.c
+index e3fa0b8..5214e05 100644
+--- a/dm/host/hle_audio.c
++++ b/dm/host/hle_audio.c
+@@ -12,7 +12,7 @@
+ enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
+ enum { BK_NONE, BK_AU, BK_NULL };   // what is consuming an output's queue right now (aout.backend)
+ 
+-typedef struct { void *ptr; uint64_t cap, size; } gbuf;     // The first 24 bytes written into the guest AudioOutBuffer
++typedef struct { uint64_t next; void *ptr; uint64_t cap, size, offset; } gbuf; // SDK AudioOutBuffer: link, data pointer, capacity, data size, data offset.
+ #define QMAX 64
+ #define RELMAX QMAX                    // Released max = number of in-flight buffers (the game must take a buffer back before it can append again), same limit as pending
+ typedef struct {
+@@ -111,8 +111,10 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
+         float v; memcpy(&v, &vb, 4);
+         for (uint64_t i = 0; i < ns; i++) { float x = s16[i] * v; s16[i] = (int16_t)(x > 32767.f ? 32767.f : x < -32768.f ? -32768.f : x); }
+     }
++    if (released || atomic_load_explicit(&a->rel_head, memory_order_acquire) != atomic_load_explicit(&a->rel_tail, memory_order_acquire)) {
++        if (a->event) notify_release(a);   // Released buffers remain ready until the client drains them, including coalesced releases.
++    }
+     if (released) {
+-        if (a->event) notify_release(a);   // the notify thread only signals the guest's event: outputs without one (the host's renderer output, games that poll) need no wake-up
+         if (a->rel_sem) dispatch_semaphore_signal(a->rel_sem);
+     }
+ }
+@@ -421,7 +423,7 @@ HLE_FORCE("_ZN2nn5audio17GetAudioOutVolumeEPKNS0_8AudioOutE", "output volume", f
+     uint32_t b = atomic_load_explicit(&ao(g)->vol, memory_order_relaxed); float v; memcpy(&v, &b, 4); return v;
+ }
+ 
+-HLE_FORCE("_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm", "buffer description; written into the first 24 bytes of the guest struct", void, h_au_SetBuf, gbuf *b, void *p, uint64_t cap, uint64_t size) {
++HLE_FORCE("_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm", "buffer description at the SDK offsets, preserving link and data offset", void, h_au_SetBuf, gbuf *b, void *p, uint64_t cap, uint64_t size) {
+     b->ptr = p; b->cap = cap; b->size = size;
+ }
+ HLE_FORCE("_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE", "buffer data pointer", void *, h_au_BufPtr, const gbuf *b) { return b->ptr; }
+@@ -442,11 +444,14 @@ HLE_FORCE("_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBuff
+ }
+ HLE_FORCE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", "get a played buffer; NULL if none", gbuf *, h_au_Released, void *g) {
+     aout *a = ao(g); gbuf *b = NULL;
++    int more = 0;
+     pthread_mutex_lock(&a->m);
+     uint32_t rr = atomic_load_explicit(&a->rel_head, memory_order_relaxed);
+     uint32_t rw = atomic_load_explicit(&a->rel_tail, memory_order_acquire);
+-    if (rr != rw) { b = a->rel[rr & (RELMAX - 1)]; atomic_store_explicit(&a->rel_head, rr + 1, memory_order_release); }
++    if (rr != rw) { b = a->rel[rr & (RELMAX - 1)]; atomic_store_explicit(&a->rel_head, rr + 1, memory_order_release); more = rr + 1 != rw; }
+     pthread_mutex_unlock(&a->m);
++    // The SDK call returns one buffer. Preserve readiness when releases coalesced into one auto-clear event.
++    if (more && a->event) notify_release(a);
+     return b;
+ }
+ 
+diff --git a/dm/host/hle_audren.c b/dm/host/hle_audren.c
+index 35e9539..cd60249 100644
+--- a/dm/host/hle_audren.c
++++ b/dm/host/hle_audren.c
+@@ -92,13 +92,13 @@ enum { CQ = 4 }; static int16_t g_cq[CQ][FRAME_MAX * 2]; static int g_cq_n[CQ];
+ static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cq_cv = PTHREAD_COND_INITIALIZER;   // the render thread signals each frame it takes off the queue (catch-up pacing)
+ static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
+ 
+-typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
++typedef struct { uint64_t next; void *ptr; uint64_t cap, size, offset; } gbuf; // same SDK layout as hle_audio.c's AudioOutBuffer
+ static void render_main(void *arg) {
+     (void)arg;
+     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
+     void *out = dm_pcmout_open(2);
+     static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
+-    for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
++    for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){.ptr=data[i], .cap=sizeof data[i]}; free_list[i] = &bufs[i]; }
+     dm_pcmout_start(out);
+     LOG("audren: render thread started (%d buffers in flight, paced by the output)", NBUF);
+     while (atomic_load(&g_open)) {
+diff --git a/dm/host/tests/t_audio.c b/dm/host/tests/t_audio.c
+index d6f8ec8..ffc000f 100644
+--- a/dm/host/tests/t_audio.c
++++ b/dm/host/tests/t_audio.c
+@@ -28,7 +28,7 @@ static int test_surround_output(void) {
+         for (int f = 0; f < FRAMES; f++) for (int ch = 0; ch < 6; ch++)
+             in[f * 6 + ch] = test < 6 ? (test == ch ? 10000 : 0) : test == 6 ? 32767 : -32768;
+         memset(out, 0xa5, sizeof out);
+-        gbuf b[2] = {{in, SPLIT * 12, SPLIT * 12}, {in + SPLIT * 6, (FRAMES - SPLIT) * 12, (FRAMES - SPLIT) * 12}};
++        gbuf b[2] = {{.ptr=in, .cap=SPLIT * 12, .size=SPLIT * 12}, {.ptr=in + SPLIT * 6, .cap=(FRAMES - SPLIT) * 12, .size=(FRAMES - SPLIT) * 12}};
+         aout a = {.ch = 6};
+         atomic_init(&a.state, STATE_STARTED); atomic_init(&a.vol, 0x3f800000u);
+         a.q[0] = b; a.q[1] = b + 1; atomic_init(&a.q_tail, 2);
+diff --git a/dm/host/tests/t_audio_spsc.c b/dm/host/tests/t_audio_spsc.c
+index 9e13d4a..6064f36 100644
+--- a/dm/host/tests/t_audio_spsc.c
++++ b/dm/host/tests/t_audio_spsc.c
+@@ -115,7 +115,31 @@ static int stop_pending(void) {
+     printf("Stop releases partial/pending buffers in order, signals and preserves pre-start buffers: %s\n",failed?"FAIL":"PASS");
+     atomic_store(&g_sig,0); return failed;
+ }
++static int coalesced_releases(void) {
++    char out[64], ev[64]; uint8_t prm[16], pcm[16] = {0}, played[16]; gbuf b[2] = {0};
++    h_au_InitParam(prm); h_au_Open(out, ev, NULL, prm);
++    aout *a = ao(out); atomic_store(&a->state, STATE_STARTED); atomic_store(&g_sig, 0);
++    for (int i = 0; i < 2; i++) { h_au_SetBuf(&b[i], pcm + i * 8, 8, 8); h_au_Append(out, &b[i]); }
++    pull(a, played, sizeof played);
++    for (int i = 0; i < 100 && atomic_load(&g_sig) < 1; i++) usleep(1000);
++    int before = atomic_load(&g_sig), failed = before < 1;
++    pull(a, played, 1); // A later callback must still report unread released buffers, without a new release.
++    for (int i = 0; i < 100 && atomic_load(&g_sig) == before; i++) usleep(1000);
++    failed |= atomic_load(&g_sig) <= before;
++    before = atomic_load(&g_sig); failed |= h_au_Released(out) != &b[0];
++    for (int i = 0; i < 100 && atomic_load(&g_sig) == before; i++) usleep(1000);
++    failed |= atomic_load(&g_sig) <= before || h_au_Released(out) != &b[1];
++    h_au_Close(out);
++    printf("Coalesced releases preserve the remaining buffer's event: %s\n", failed ? "FAIL" : "PASS");
++    return failed;
++}
++
+ int main(void) {
++    // SDK 4.4.1 reads pointer and data size directly at +8 and +24.
++    uint64_t wire[5] = {0x1234, 0, 0, 0, 0x5678}; uint8_t pcm[16];
++    h_au_SetBuf((gbuf *)wire, pcm, sizeof pcm, 12);
++    if (wire[0] != 0x1234 || wire[1] != (uintptr_t)pcm || wire[2] != sizeof pcm || wire[3] != 12 || wire[4] != 0x5678) return 1;
++    if (coalesced_releases()) return 1;
+     if (stop_pending()) return 1;
+     char out[64], ev[64]; uint8_t prm[16];
+     test_ctx t = {0};
